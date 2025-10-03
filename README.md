@@ -55,10 +55,10 @@ segmentation_models_pytorch>=0.3.3
 
 ### Windows (OSGeo4W / Standalone)
 ```bat
-"C:\Program Files\QGIS 3.40pps\Python311\python.exe" -m pip install --upgrade pip setuptools wheel
-"C:\Program Files\QGIS 3.40pps\Python311\python.exe" -m pip install rasterio shapely geopandas scipy numpy pillow
-"C:\Program Files\QGIS 3.40pps\Python311\python.exe" -m pip install torch torchvision --extra-index-url https://download.pytorch.org/whl/cpu
-"C:\Program Files\QGIS 3.40pps\Python311\python.exe" -m pip install segmentation_models_pytorch albumentations scikit-learn tensorboard tqdm pyproj
+"C:\Program Files\QGIS 3.40.XX\apps\Python311\python.exe" -m pip install --upgrade pip setuptools wheel
+"C:\Program Files\QGIS 3.40.XX\apps\Python311\python.exe" -m pip install rasterio shapely geopandas scipy numpy pillow
+"C:\Program Files\QGIS 3.40.XX\apps\Python311\python.exe" -m pip install torch torchvision --extra-index-url https://download.pytorch.org/whl/cpu
+"C:\Program Files\QGIS 3.40.XX\apps\Python311\python.exe" -m pip install segmentation_models_pytorch albumentations scikit-learn tensorboard tqdm pyproj
 ```
 
 ### Linux
