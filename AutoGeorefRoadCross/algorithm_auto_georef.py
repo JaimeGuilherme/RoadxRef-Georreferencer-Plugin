@@ -1,0 +1,206 @@
+# -*- coding: utf-8 -*-
+import os, tempfile, math, json, sys, shutil
+from typing import List, Tuple
+
+from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.core import (
+    QgsProcessing, QgsProcessingAlgorithm, QgsProcessingException,
+    QgsProcessingParameterVectorLayer, QgsProcessingParameterRasterLayer,
+    QgsProcessingParameterFile, QgsProcessingParameterBoolean,
+    QgsProcessingParameterNumber, QgsProcessingParameterEnum,
+    QgsProcessingParameterFolderDestination, QgsProcessingParameterRasterDestination,
+    QgsProcessingParameterFileDestination, QgsProcessingContext, QgsProcessingFeedback,
+    QgsVectorLayer, QgsRasterLayer, QgsFields, QgsField, QgsFeature, QgsGeometry,
+    QgsProject, QgsCoordinateTransformContext, QgsWkbTypes, QgsCoordinateReferenceSystem
+)
+import processing
+
+# Local components (bundled copies; adapted from the user's code)
+from .components.dataset import read_raster_window_select_bands
+from .components.infer_helpers import TorchInferencer
+from .components.associate_helpers import associate_points_hungarian, build_gcps_from_pairs
+from .components.requirements_check import ensure_requirements
+
+class AlgoAutoGeoref(QgsProcessingAlgorithm):
+    """
+    Processing algorithm that performs:
+      - OSM filter by fclass (primary/secondary/tertiary/residential) and line intersections.
+      - Patch tiling of the raster (256x256) and PyTorch inference (.pth provided).
+      - Hungarian matching between detected crossings and OSM intersections.
+      - Builds GCPs and georeferences the raster using Polynomial 1 (order 1) and Cubic (4x4) resampling.
+    """
+    # Parameter keys
+    P_ROADS = "roads"
+    P_RASTER = "raster"
+    P_MODEL = "pth_model"
+    P_BANDSMODE = "bands_mode"
+    P_BATCH = "batch_size"
+    P_EXPORT_POINTS = "export_points"
+    P_EXPORT_INFERRED = "export_inferred_points"
+    P_OUTPUT_DIR = "output_folder"
+    P_OUT_RASTER = "output_raster"
+
+    def initAlgorithm(self, config=None):
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_ROADS, "Malha rodoviária (linhas, com coluna 'fclass')", [QgsProcessing.TypeVectorLine]
+        ))
+        self.addParameter(QgsProcessingParameterRasterLayer(
+            self.P_RASTER, "Imagem de satélite (TIFF)"
+        ))
+        self.addParameter(QgsProcessingParameterFile(
+            self.P_MODEL, "Modelo PyTorch (.pth)", extension="pth", behavior=QgsProcessingParameterFile.File, fileFilter="*.pth"
+        ))
+        self.addParameter(QgsProcessingParameterEnum(
+            self.P_BANDSMODE, "Bandas", options=["rgb", "rgbnir"], defaultValue=1
+        ))
+        # Advanced
+        p_batch = QgsProcessingParameterNumber(self.P_BATCH, "Batch size (PyTorch)", 
+                                               type=QgsProcessingParameterNumber.Integer, defaultValue=32)
+        p_batch.setFlags(p_batch.flags() | QgsProcessingParameterNumber.FlagAdvanced)
+        self.addParameter(p_batch)
+
+        p_exp = QgsProcessingParameterBoolean(self.P_EXPORT_POINTS, "Exportar .points / .csv dos homólogos (antes do warp)", defaultValue=True)
+        p_exp.setFlags(p_exp.flags() | QgsProcessingParameterBoolean.FlagAdvanced)
+        self.addParameter(p_exp)
+
+        p_inf = QgsProcessingParameterBoolean(self.P_EXPORT_INFERRED, "Exportar pontos inferidos (GeoJSON)", defaultValue=False)
+        p_inf.setFlags(p_inf.flags() | QgsProcessingParameterBoolean.FlagAdvanced)
+        self.addParameter(p_inf)
+
+        self.addParameter(QgsProcessingParameterFolderDestination(
+            self.P_OUTPUT_DIR, "Pasta de saída"
+        ))
+        self.addParameter(QgsProcessingParameterRasterDestination(
+            self.P_OUT_RASTER, "Imagem georreferenciada (TIFF)"
+        ))
+
+    def name(self):
+        return "autogeoref_roadcross"
+
+    def displayName(self):
+        return "AutoGeoref RoadCross (OSM + UNet + Georef)"
+
+    def group(self):
+        return "Georreferenciamento"
+
+    def groupId(self):
+        return "georeferencing"
+
+    def shortHelpString(self):
+        return self.tr("""
+Fluxo:
+1) Filtra 'fclass' em {'primary','secondary','tertiary','residential'} e calcula interseções de linhas.
+2) Tile 256x256 do raster e inferência com PyTorch (.pth).
+3) Associação detectados↔OSM (método húngaro) para gerar GCPs.
+4) Georreferencia com Polynomial 1 (ordem 1) e reamostragem Cúbica (4x4).
+
+Opções avançadas: batch (padrão 32), export de GCPs (.points/.csv) e dos pontos inferidos.
+        """)
+
+    def tr(self, string):
+        return QCoreApplication.translate("AlgoAutoGeoref", string)
+
+    def processAlgorithm(self, parameters, context: QgsProcessingContext, feedback: QgsProcessingFeedback):
+        ensure_requirements(feedback)
+
+        # Read parameters
+        vlayer: QgsVectorLayer = self.parameterAsVectorLayer(parameters, self.P_ROADS, context)
+        rlayer: QgsRasterLayer = self.parameterAsRasterLayer(parameters, self.P_RASTER, context)
+        pth = self.parameterAsFile(parameters, self.P_MODEL, context)
+        bands_mode_idx = self.parameterAsEnum(parameters, self.P_BANDSMODE, context)
+        bands_mode = ["rgb", "rgbnir"][bands_mode_idx]
+        batch_size = int(self.parameterAsInt(parameters, self.P_BATCH, context))
+        export_points = self.parameterAsBool(parameters, self.P_EXPORT_POINTS, context)
+        export_inferred = self.parameterAsBool(parameters, self.P_EXPORT_INFERRED, context)
+        out_folder = self.parameterAsFileOutput(parameters, self.P_OUTPUT_DIR, context)
+        out_georef = self.parameterAsOutputLayer(parameters, self.P_OUT_RASTER, context)
+
+        if vlayer is None or rlayer is None:
+            raise QgsProcessingException("Camadas de entrada inválidas.")
+        if not os.path.exists(pth):
+            raise QgsProcessingException("Arquivo .pth não encontrado.")
+
+        os.makedirs(out_folder, exist_ok=True)
+        tmp_dir = tempfile.mkdtemp(prefix="autogeoref_", dir=out_folder)
+
+        feedback.pushInfo("1) Filtrando malha rodoviária por fclass…")
+        # Build expression to filter
+        expr = "\"fclass\" IN ('primary','secondary','tertiary','residential')"
+        filt = processing.run("native:extractbyexpression", {
+            'INPUT': vlayer,
+            'EXPRESSION': expr,
+            'OUTPUT': 'memory:'
+        }, context=context, feedback=feedback)['OUTPUT']
+
+        feedback.pushInfo("2) Calculando interseções…")
+        inters = processing.run("native:lineintersections", {
+            'INPUT': filt,
+            'INPUT_FIELDS': [],
+            'INTERSECT': filt,
+            'INTERSECT_FIELDS': [],
+            'INPUT_FIELDS_PREFIX': '',
+            'INTERSECT_FIELDS_PREFIX': '',
+            'OUTPUT': 'memory:'
+        }, context=context, feedback=feedback)['OUTPUT']
+
+        # Deduplicate intersection points by geometry
+        inters_uniq = processing.run("native:deleteduplicategeometries", {
+            'INPUT': inters, 'OUTPUT':'memory:'
+        }, context=context, feedback=feedback)['OUTPUT']
+        feedback.pushInfo(f"Interseções únicas: {inters_uniq.featureCount()}")
+
+        # 3) Patch infer
+        feedback.pushInfo("3) Inferindo cruzamentos na imagem…")
+        inferencer = TorchInferencer(model_path=pth, bands_mode=bands_mode, batch_size=batch_size, feedback=feedback)
+        # get raster path
+        raster_path = rlayer.dataProvider().dataSourceUri().split("|")[0]
+        detected_points_gpkg = os.path.join(out_folder, "pontos_inferidos.gpkg")
+        inferencer.run_on_raster(raster_path, out_points_gpkg=detected_points_gpkg)
+
+        if export_inferred:
+            feedback.pushInfo(f"Pontos inferidos exportados: {detected_points_gpkg}")
+
+        # 4) Associate to OSM intersections
+        feedback.pushInfo("4) Associando pontos (método húngaro)…")
+        pairs_geojson = os.path.join(out_folder, "pares_homologos.geojson")
+        gcp_csv, points_txt = associate_points_hungarian(
+            detected_points_path=detected_points_gpkg,
+            osm_points_layer=inters_uniq,
+            output_pairs_geojson=pairs_geojson,
+            feedback=feedback
+        )
+        feedback.pushInfo(f"Pares salvos: {pairs_geojson}")
+
+        # 5) Build GCPs and georeference
+        feedback.pushInfo("5) Georreferenciando raster via GCPs (Polynomial 1 + Cubic)…")
+        gcps = build_gcps_from_pairs(pairs_geojson)
+        if len(gcps) < 3:
+            raise QgsProcessingException("GCPs insuficientes (<3) para Polynomial 1.")
+        # Use GDAL Python API via QGIS (gdal.Translate + gdal.Warp)
+        from osgeo import gdal
+        gdal.UseExceptions()
+
+        tmp_gcpraster = os.path.join(tmp_dir, "with_gcps.tif")
+        ds = gdal.Open(raster_path, gdal.GA_ReadOnly)
+        translate_opts = gdal.TranslateOptions(GCPs=gcps)
+        _ = gdal.Translate(tmp_gcpraster, ds, options=translate_opts)
+        ds = None
+
+        warp_opts = gdal.WarpOptions(
+            tps=False,  # polynomial
+            order=1,
+            resampleAlg="cubic",
+            dstSRS=inters_uniq.sourceCrs().toWkt()  # target CRS from OSM
+        )
+        _ = gdal.Warp(out_georef, tmp_gcpraster, options=warp_opts)
+
+        # Optional exports
+        if export_points and gcp_csv and points_txt:
+            feedback.pushInfo(f"GCP CSV: {gcp_csv}")
+            feedback.pushInfo(f".points: {points_txt}")
+
+        feedback.pushInfo("✅ Finalizado.")
+        return {
+            self.P_OUTPUT_DIR: out_folder,
+            self.P_OUT_RASTER: out_georef
+        }
