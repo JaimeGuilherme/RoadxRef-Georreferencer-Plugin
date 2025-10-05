@@ -101,7 +101,7 @@ Se você precisar de binários extra do ecossistema GDAL (não obrigatório para
 Há duas formas:
 
 ### 1) Via ZIP (recomendado para usuários)
-No QGIS: **Plugins → Manage and Install… → Install from ZIP** e selecione o arquivo `.zip` deste repositório (pasta `dist/` ou GitHub Release).
+No QGIS: **Plugins → Manage and Install… → Install from ZIP** e selecione o zip criado a partir da pasta `AutoGeorefRoadCross` baixada deste repositório.
 
 ### 2) Via código fonte (desenvolvedores)
 Copie a pasta `AutoGeorefRoadCross/` para:
