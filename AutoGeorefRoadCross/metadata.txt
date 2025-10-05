@@ -2,7 +2,7 @@
 name=AutoGeoref RoadCross
 qgisMinimumVersion=3.34
 qgisMaximumVersion=3.99
-description=Detecta cruzamentos de vias em imagem de satélite com modelo PyTorch, associa aos cruzamentos OSM e georreferencia a imagem (Polynomial 1, cubic 4x4)
+description=Detecta cruzamentos de vias em imagem de satélite com modelo PyTorch, associa aos cruzamentos OSM e georreferencia a imagem (Polynomial 1, cubic 4x4; configurável nas Opções Avançadas).
 version=0.1.0
 author=Jaime Guilherme Loureiro Breda, Leonardo Seiichi Kudo, Isaac Lima Uchôa
 email=jaime.guilherme67@gmail.com

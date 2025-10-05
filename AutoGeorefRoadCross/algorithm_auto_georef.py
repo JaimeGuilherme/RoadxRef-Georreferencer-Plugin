@@ -37,6 +37,8 @@ class AlgoAutoGeoref(QgsProcessingAlgorithm):
     P_BATCH = "batch_size"
     P_EXPORT_POINTS = "export_points"
     P_EXPORT_INFERRED = "export_inferred_points"
+    P_TRANSFORM = "transform_order"
+    P_RESAMPLE  = "resample_alg"
     P_OUTPUT_DIR = "output_folder"
     P_OUT_RASTER = "output_raster"
 
@@ -67,6 +69,26 @@ class AlgoAutoGeoref(QgsProcessingAlgorithm):
         p_inf.setFlags(p_inf.flags() | QgsProcessingParameterBoolean.FlagAdvanced)
         self.addParameter(p_inf)
 
+        # Transformação (GDAL Warp) — padrão: Polynomial 1
+        p = QgsProcessingParameterEnum(
+            self.P_TRANSFORM,
+            "Transformação (GDAL Warp)",
+            options=["Polynomial 1", "Polynomial 2", "Polynomial 3", "Thin Plate Spline (TPS)"],
+            defaultValue=0
+        )
+        p.setFlags(p.flags() | p.FlagAdvanced)
+        self.addParameter(p)
+
+        # Interpolação (GDAL Warp) — padrão: cubic (4x4)
+        p = QgsProcessingParameterEnum(
+            self.P_RESAMPLE,
+            "Interpolação (GDAL Warp)",
+            options=["near","bilinear","cubic (4x4 kernel)","cubicspline","lanczos","average","mode","max","min","med","q1","q3"],
+            defaultValue=2
+        )
+        p.setFlags(p.flags() | p.FlagAdvanced)
+        self.addParameter(p)
+
         self.addParameter(QgsProcessingParameterFolderDestination(
             self.P_OUTPUT_DIR, "Pasta de saída"
         ))
@@ -93,6 +115,7 @@ Fluxo:
 2) Tile 256x256 do raster e inferência com PyTorch (.pth).
 3) Associação detectados↔OSM (método húngaro) para gerar GCPs.
 4) Georreferencia com Polynomial 1 (ordem 1) e reamostragem Cúbica (4x4).
+(Opções avançadas permitem escolher Polynomial 2/3 ou TPS e outros métodos de interpolação.)
 
 Opções avançadas: batch (padrão 32), export de GCPs (.points/.csv) e dos pontos inferidos.
         """)
@@ -112,6 +135,8 @@ Opções avançadas: batch (padrão 32), export de GCPs (.points/.csv) e dos pon
         batch_size = int(self.parameterAsInt(parameters, self.P_BATCH, context))
         export_points = self.parameterAsBool(parameters, self.P_EXPORT_POINTS, context)
         export_inferred = self.parameterAsBool(parameters, self.P_EXPORT_INFERRED, context)
+        transform_idx = self.parameterAsEnum(parameters, self.P_TRANSFORM, context)
+        resample_idx  = self.parameterAsEnum(parameters, self.P_RESAMPLE,  context)
         out_folder = self.parameterAsFileOutput(parameters, self.P_OUTPUT_DIR, context)
         out_georef = self.parameterAsOutputLayer(parameters, self.P_OUT_RASTER, context)
 
@@ -186,12 +211,30 @@ Opções avançadas: batch (padrão 32), export de GCPs (.points/.csv) e dos pon
         _ = gdal.Translate(tmp_gcpraster, ds, options=translate_opts)
         ds = None
 
-        warp_opts = gdal.WarpOptions(
-            tps=False,  # polynomial
-            order=1,
-            resampleAlg="cubic",
-            dstSRS=inters_uniq.sourceCrs().toWkt()  # target CRS from OSM
-        )
+        # Mapas índice → opção do GDAL
+        _transform_opts = ["poly1", "poly2", "poly3", "tps"]
+        _resample_opts  = ["near","bilinear","cubic","cubicspline","lanczos","average","mode","max","min","med","q1","q3"]
+
+        chosen_transform = _transform_opts[transform_idx]
+        chosen_resample  = _resample_opts[resample_idx]
+
+        feedback.pushInfo(f"5) Georreferenciando raster (transform: {chosen_transform}; resample: {chosen_resample})")
+
+        if chosen_transform == "tps":
+            warp_opts = gdal.WarpOptions(
+                tps=True,
+                resampleAlg=chosen_resample,
+                dstSRS=inters_uniq.sourceCrs().toWkt()
+            )
+        else:
+            order = 1 if chosen_transform == "poly1" else (2 if chosen_transform == "poly2" else 3)
+            warp_opts = gdal.WarpOptions(
+                tps=False,
+                order=order,
+                resampleAlg=chosen_resample,
+                dstSRS=inters_uniq.sourceCrs().toWkt()
+            )
+
         _ = gdal.Warp(out_georef, tmp_gcpraster, options=warp_opts)
 
         # Optional exports
@@ -204,3 +247,6 @@ Opções avançadas: batch (padrão 32), export de GCPs (.points/.csv) e dos pon
             self.P_OUTPUT_DIR: out_folder,
             self.P_OUT_RASTER: out_georef
         }
+
+def createInstance(self):
+    return AlgoAutoGeoref()
