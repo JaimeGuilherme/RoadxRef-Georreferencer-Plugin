@@ -1,141 +1,208 @@
 # -*- coding: utf-8 -*-
-import os, math, json
-import numpy as np
-import geopandas as gpd
-from shapely.geometry import Point
-from scipy.optimize import linear_sum_assignment
+import os, math, numpy as np
+from qgis.PyQt.QtCore import QVariant
+from qgis.core import (
+    QgsVectorLayer, QgsFeature, QgsGeometry, QgsPointXY, QgsFields, QgsField,
+    QgsCoordinateTransform, QgsCoordinateReferenceSystem, QgsVectorFileWriter, QgsProject
+)
+from osgeo import gdal
 
-def _coords_xy(gdf):
-    return np.column_stack((gdf.geometry.x.values, gdf.geometry.y.values))
+def _utm_from_layer(layer: QgsVectorLayer) -> QgsCoordinateReferenceSystem:
+    ext = layer.extent()
+    cx, cy = ext.center().x(), ext.center().y()
+    zone = int(math.floor((cx + 180.0) / 6.0) + 1)
+    epsg = 32600 + zone if cy >= 0 else 32700 + zone
+    return QgsCoordinateReferenceSystem.fromEpsgId(epsg)
 
-def _metric_crs_for(gdf: gpd.GeoDataFrame):
-    if gdf.crs is None or getattr(gdf.crs, "is_geographic", False):
-        cen = gdf.geometry.unary_union.centroid
-        lon, lat = float(cen.x), float(cen.y)
-        zone = int(math.floor((lon + 180.0) / 6.0) + 1)
-        epsg = 32600 + zone if lat >= 0 else 32700 + zone
-        return f"EPSG:{epsg}"
-    return gdf.crs
+def _as_layer(obj, name='layer') -> QgsVectorLayer:
+    if isinstance(obj, QgsVectorLayer):
+        return obj
+    vl = QgsVectorLayer(obj, name, 'ogr')
+    if not vl or not vl.isValid():
+        raise RuntimeError(f'Não foi possível abrir camada: {obj}')
+    return vl
 
-def _tile_key(x: float, y: float, tile_size: float):
-    return (int(math.floor(x / tile_size)), int(math.floor(y / tile_size)))
+def _linear_sum_assignment(cost):
+    cost = np.array(cost, dtype=np.float64)
+    n, m = cost.shape
+    INF = cost.max() + 1e6 if cost.size else 1e9
+    if n < m:
+        pad = np.full((m-n, m), INF, dtype=np.float64); cost = np.vstack([cost, pad]); n = m
+    elif m < n:
+        pad = np.full((n, n-m), INF, dtype=np.float64); cost = np.hstack([cost, pad]); m = n
+    C = cost.copy()
+    C -= C.min(axis=1, keepdims=True)
+    C -= C.min(axis=0, keepdims=True)
+    N = C.shape[0]
+    starred = np.zeros((N, N), dtype=bool)
+    primed  = np.zeros((N, N), dtype=bool)
+    row_cov = np.zeros(N, dtype=bool)
+    col_cov = np.zeros(N, dtype=bool)
+    for i in range(N):
+        for j in range(N):
+            if C[i, j] == 0 and not row_cov[i] and not col_cov[j]:
+                starred[i, j] = True; row_cov[i] = True; col_cov[j] = True; break
+    row_cov[:] = False; col_cov[:] = False
+    def cover(): col_cov[:] = starred.any(axis=0); row_cov[:] = False
+    def find_a_zero():
+        for i in range(N):
+            if row_cov[i]: continue
+            for j in range(N):
+                if (not col_cov[j]) and C[i, j] == 0 and not primed[i, j]:
+                    return i, j
+        return None
+    def find_star_in_row(i):
+        js = np.where(starred[i])[0]; return int(js[0]) if len(js) else None
+    def find_star_in_col(j):
+        is_ = np.where(starred[:, j])[0]; return int(is_[0]) if len(is_) else None
+    def find_prime_in_row(i):
+        js = np.where(primed[i])[0]; return int(js[0]) if len(js) else None
+    def augment_path(path):
+        for (ii, jj) in path: starred[ii, jj] = not starred[ii, jj]
+    def clear_primes(): primed[:] = False
+    cover()
+    while col_cov.sum() < N:
+        z = find_a_zero()
+        if z is None:
+            mask = ~row_cov[:, None] & ~col_cov[None, :]
+            s = C[mask].min()
+            C[~row_cov] -= s; C[:, col_cov] += s; continue
+        i, j = z; primed[i, j] = True
+        j_star = find_star_in_row(i)
+        if j_star is not None:
+            row_cov[i] = True; col_cov[j_star] = False
+        else:
+            path = [(i, j)]
+            while True:
+                i_star = find_star_in_col(path[-1][1])
+                if i_star is None: break
+                path.append((i_star, path[-1][1]))
+                j_prime = find_prime_in_row(i_star)
+                path.append((i_star, j_prime))
+            augment_path(path); clear_primes(); cover()
+    rows, cols = np.where(starred)
+    return rows, cols
 
-def _build_tile_index(xy: np.ndarray, tile_size: float):
-    idx = {}
-    for j, (x, y) in enumerate(xy):
-        idx.setdefault(_tile_key(x,y,tile_size), []).append(j)
-    return idx
+def associate_points_hungarian(detected_points_path, osm_points_layer, output_pairs_geojson,
+                               feedback=None, max_distance=20.0):
+    det = _as_layer(detected_points_path, 'det')
+    osm = _as_layer(osm_points_layer, 'osm')
 
-def _neighbors(tk):
-    tx, ty = tk
-    for dx in (-1,0,1):
-        for dy in (-1,0,1):
-            yield (tx+dx, ty+dy)
+    metric = _utm_from_layer(osm if osm.featureCount() > 0 else det)
+    tr_det = QgsCoordinateTransform(det.crs(), metric, QgsProject.instance())
+    tr_osm = QgsCoordinateTransform(osm.crs(), metric, QgsProject.instance())
 
-def _hungarian_tiled(det_xy: np.ndarray, osm_xy: np.ndarray, radius: float):
-    tile_size = radius * 2.0
-    tile_index = _build_tile_index(osm_xy, tile_size)
-    edges_by_tile = {}
-    for i, (xd, yd) in enumerate(det_xy):
-        tk = _tile_key(xd, yd, tile_size)
-        cand = []
-        for nb in _neighbors(tk):
-            cand.extend(tile_index.get(nb, []))
-        if not cand:
-            continue
-        c_xy = osm_xy[np.array(cand)]
-        d = np.hypot(c_xy[:,0]-xd, c_xy[:,1]-yd)
-        ok = d <= radius
-        if not np.any(ok): continue
-        for j_local, dist in zip(np.array(cand)[ok], d[ok]):
-            edges_by_tile.setdefault(tk, []).append((i, int(j_local), float(dist)))
+    det_feats = list(det.getFeatures())
+    osm_feats = list(osm.getFeatures())
+    if not det_feats or not osm_feats:
+        raise RuntimeError("Sem pontos suficientes para associação.")
 
-    det_idx_sel, osm_idx_sel, dist_sel = [], [], []
+    det_xy, det_xy_src = [], []
+    for f in det_feats:
+        p_src = f.geometry().asPoint()
+        p = tr_det.transform(p_src)
+        det_xy_src.append((p_src.x(), p_src.y()))  # guardar XY no CRS original da detecção (para pixel depois)
+        det_xy.append((p.x(), p.y()))
+    osm_xy = []
+    for f in osm_feats:
+        p = tr_osm.transform(f.geometry().asPoint())
+        osm_xy.append((p.x(), p.y()))
+
+    det_xy = np.array(det_xy, dtype=np.float64)
+    osm_xy = np.array(osm_xy, dtype=np.float64)
+
     INF = 1e9
-    for tk, edges in edges_by_tile.items():
-        dets = sorted({i for (i,_,_) in edges})
-        osms = sorted({j for (_,j,_) in edges})
-        md = {i:k for k,i in enumerate(dets)}
-        mo = {j:k for k,j in enumerate(osms)}
-        D = np.full((len(dets), len(osms)), INF, dtype=np.float32)
-        for (i,j,dist) in edges:
-            D[md[i], mo[j]] = min(D[md[i], mo[j]], dist)
-        r, c = linear_sum_assignment(D)
-        for rr, cc in zip(r,c):
-            dd = float(D[rr,cc])
-            if dd <= radius and dd < INF:
-                det_idx_sel.append(dets[rr]); osm_idx_sel.append(osms[cc]); dist_sel.append(dd)
-    return det_idx_sel, osm_idx_sel, dist_sel
+    cost = np.full((len(det_feats), len(osm_feats)), INF, dtype=np.float64)
+    for i, (xd, yd) in enumerate(det_xy):
+        d = np.hypot(osm_xy[:, 0] - xd, osm_xy[:, 1] - yd)
+        ok = d <= max_distance
+        cost[i, ok] = d[ok]
 
-def associate_points_hungarian(detected_points_path: str, osm_points_layer, output_pairs_geojson: str, feedback=None, max_distance: float=20.0):
-    det = gpd.read_file(detected_points_path)
-    osm = gpd.read_file(osm_points_layer.source()) if hasattr(osm_points_layer, "source") else gpd.GeoDataFrame(osm_points_layer)
+    r, c = _linear_sum_assignment(cost)
 
-    # CRS harmonization to metric
-    metric_crs = _metric_crs_for(det if len(det) else osm)
-    if det.crs is None or str(det.crs) != str(metric_crs):
-        det = det.to_crs(metric_crs)
-    if osm.crs is None or str(osm.crs) != str(metric_crs):
-        osm = osm.to_crs(metric_crs)
+    # Saída: pares contendo det_x/det_y (em CRS da detecção) e osm_x/osm_y (em CRS do OSM)
+    fields = QgsFields()
+    fields.append(QgsField('dist_m', QVariant.Double))
+    fields.append(QgsField('det_x', QVariant.Double))
+    fields.append(QgsField('det_y', QVariant.Double))
+    fields.append(QgsField('osm_x', QVariant.Double))
+    fields.append(QgsField('osm_y', QVariant.Double))
 
-    det = det[det.geometry.notna()].copy()
-    osm = osm[osm.geometry.notna()].copy()
+    out = QgsVectorLayer(f'Point?crs={osm.crs().authid()}', 'pares', 'memory')
+    pr = out.dataProvider()
+    pr.addAttributes(fields); out.updateFields()
 
-    if len(det) == 0 or len(osm) == 0:
-        raise RuntimeError("Sem pontos para associação.")
+    feats_out = []
+    for i, j in zip(r, c):
+        if i < len(det_feats) and j < len(osm_feats) and cost[i, j] < INF and cost[i, j] <= max_distance:
+            fd = det_feats[i]; fo = osm_feats[j]
+            osm_pt = fo.geometry().asPoint()
+            det_src_x, det_src_y = det_xy_src[i]
 
-    XYd = _coords_xy(det).astype(np.float32)
-    XYo = _coords_xy(osm).astype(np.float32)
-    i_sel, j_sel, d_sel = _hungarian_tiled(XYd, XYo, radius=max_distance)
+            f = QgsFeature(out.fields())
+            f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(osm_pt.x(), osm_pt.y())))
+            f.setAttributes([
+                float(cost[i, j]),
+                float(det_src_x), float(det_src_y),
+                float(osm_pt.x()), float(osm_pt.y())
+            ])
+            feats_out.append(f)
 
-    rows = []
-    for i, j, d in zip(i_sel, j_sel, d_sel):
-        gd = det.iloc[i]; go = osm.iloc[j]
-        rows.append({
-            'dist_m': float(d),
-            'det_x': float(gd.geometry.x), 'det_y': float(gd.geometry.y),
-            'osm_x': float(go.geometry.x), 'osm_y': float(go.geometry.y),
-            'geometry': gd.geometry
-        })
-    gdf_pairs = gpd.GeoDataFrame(rows, geometry='geometry', crs=metric_crs)
-    os.makedirs(os.path.dirname(output_pairs_geojson), exist_ok=True)
-    gdf_pairs.to_file(output_pairs_geojson, driver='GeoJSON')
+    pr.addFeatures(feats_out); out.updateExtents()
 
-    # Export .points and CSV for QGIS georeferencer
-    gcp_csv = os.path.join(os.path.dirname(output_pairs_geojson), "gcp_qgis.csv")
-    pts_txt = os.path.join(os.path.dirname(output_pairs_geojson), "gcp_qgis.points")
-    import pandas as pd
-    gcp_rows = []
-    for k, r in enumerate(rows, start=1):
-        # We don't have pixelX/Y here because we inferred directly on world coords.
-        # We treat detected point coords as "dst" and OSM as "map".
-        gcp_rows.append({
-            'id': k,
-            'mapX': r['osm_x'], 'mapY': r['osm_y'],
-            'pixelX': None, 'pixelY': None, 'enable': 1
-        })
-    pd.DataFrame(gcp_rows).to_csv(gcp_csv, index=False)
+    options = QgsVectorFileWriter.SaveVectorOptions()
+    options.driverName = 'GeoJSON'
+    _err, _ = QgsVectorFileWriter.writeAsVectorFormatV3(
+        out, output_pairs_geojson, QgsProject.instance().transformContext(), options
+    )
 
-    with open(pts_txt, 'w', encoding='utf-8') as f:
-        for r in gcp_rows:
-            f.write(f"{r['mapX']},{r['mapY']},{''},{''},{r['enable']}\n")
+    # Também geramos CSV/.points para o georreferenciador (pixel será preenchido depois)
+    csv_path  = os.path.join(os.path.dirname(output_pairs_geojson), 'gcp_qgis.csv')
+    pts_path  = os.path.join(os.path.dirname(output_pairs_geojson), 'gcp_qgis.points')
+    with open(csv_path, 'w', encoding='utf-8') as f:
+        f.write('id,mapX,mapY,pixelX,pixelY,enable\n')
+        for k, ft in enumerate(out.getFeatures(), start=1):
+            f.write(f"{k},{ft['osm_x']},{ft['osm_y']},,,1\n")
+    with open(pts_path, 'w', encoding='utf-8') as f:
+        for ft in out.getFeatures():
+            f.write(f"{ft['osm_x']},{ft['osm_y']},,,1\n")
 
     if feedback:
-        feedback.pushInfo(f"GCP CSV: {gcp_csv}")
-        feedback.pushInfo(f".points: {pts_txt}")
+        feedback.pushInfo(f"GCP CSV: {csv_path}")
+        feedback.pushInfo(f".points: {pts_path}")
 
-    return gcp_csv, pts_txt
+    return csv_path, pts_path
 
-def build_gcps_from_pairs(pairs_geojson: str):
-    # Build gdal.GCP list mapping from raster pixel to map coordinates.
-    # NOTE: Since we inferred in world CRS directly, we approximate pixel coords using nearest raster geotransform via inverse mapping is not available here.
-    # Instead, GDAL can accept only map coords if we use Warp with tps=True; however, requirement asks Polynomial 1.
-    # To adhere, we pass map coords with dummy pixel coords (this lets Warp fit using geolocations of the raster).
-    import json
-    from osgeo import gdal
-    data = gpd.read_file(pairs_geojson)
+def build_gcps_from_pairs(pairs_geojson, raster_path):
+    """ Constrói lista de gdal.GCP usando:
+        - pixelX/pixelY = inverso(GeoTransform do raster) sobre (det_x, det_y)
+        - mapX/mapY     = (osm_x, osm_y)
+    """
+    vl = QgsVectorLayer(pairs_geojson, 'pares', 'ogr')
+    if not vl or not vl.isValid():
+        raise RuntimeError(f'Não foi possível abrir pares: {pairs_geojson}')
+
+    ds = gdal.Open(raster_path, gdal.GA_ReadOnly)
+    if ds is None:
+        raise RuntimeError(f'Não foi possível abrir raster: {raster_path}')
+    gt = ds.GetGeoTransform()
+    inv = gdal.InvGeoTransform(gt)
+    if inv is None:
+        raise RuntimeError('Falha ao inverter GeoTransform do raster.')
+    inv_gt, ok = inv
+    if not ok:
+        raise RuntimeError('GeoTransform não invertível.')
+
+    def world_to_pixel(x, y):
+        px = inv_gt[0] + inv_gt[1]*x + inv_gt[2]*y
+        py = inv_gt[3] + inv_gt[4]*x + inv_gt[5]*y
+        return float(px), float(py)
+
     gcps = []
-    # Use a rough grid of fake pixel coords for stability (ordered list)
-    for idx, row in data.iterrows():
-        gcps.append(gdal.GCP(row['osm_x'], row['osm_y'], 0, row['det_x'], row['det_y']))
+    for ft in vl.getFeatures():
+        det_x = float(ft['det_x']); det_y = float(ft['det_y'])
+        osm_x = float(ft['osm_x']); osm_y = float(ft['osm_y'])
+        px, py = world_to_pixel(det_x, det_y)
+        gcps.append(gdal.GCP(osm_x, osm_y, 0.0, px, py))
+
     return gcps
